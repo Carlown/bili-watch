@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="投稿观察 Bili Watch">
+  <title>投稿观察 Bili Watch</title>
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c4506f"/>
+      <stop offset="1" stop-color="#9c2f4e"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#badge)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="38" stroke-linecap="round">
+    <circle cx="232" cy="220" r="118"/>
+    <path d="M315 303 405 393"/>
+  </g>
+  <path d="M194 156 194 284 298 220Z" fill="#ffffff"/>
+</svg>

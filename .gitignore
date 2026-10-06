@@ -1,0 +1,36 @@
+# Local runtime data — never commit browser profiles (they can hold signed-in cookies)
+.venv/
+__pycache__/
+*.pyc
+EdgeProfile/
+*-profile/
+dom-probe-profile/
+probe-profile/
+visible-probe-profile/
+.package-qa/
+package-qa/
+package-smoke-*/
+qa-*/
+qa-data/
+instance.lock
+running.json
+*.log
+*.sqlite3
+live-feed.json
+ui-preview.png
+
+# Build output and historical snapshots
+build/
+build-*/
+dist/
+dist-*/
+*.bak
+*.work
+
+# Historical per-feature build specs (the current one is BiliWatch.spec)
+BiliWatch*.spec
+!BiliWatch.spec
+
+# Internal task scaffolding (EXECUTION.md stays local but is left unignored on purpose)
+task-*.json
+.l-skill-tasks/
