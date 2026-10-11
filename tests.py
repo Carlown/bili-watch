@@ -24,6 +24,28 @@ def payload(items, more=False, offset=""):
     return {"code": 0, "data": {"items": items, "has_more": more, "offset": offset}}
 
 
+class ViewResponse:
+    """Minimal stand-in for the urllib response of the B 站 view endpoint."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def view_opener(marks):
+    """Answer `copyright` per BV 号 so probe tests never touch the network."""
+    return lambda request, timeout=None: ViewResponse(
+        {"code": 0, "data": {"copyright": marks[request.full_url.split("bvid=")[-1]]}})
+
+
 class Feed:
     def __init__(self, head, pages=None):
         self.head, self.pages = head, pages or {}
@@ -125,8 +147,9 @@ class MonitoringTests(unittest.TestCase):
             login_confirmed = True
 
         class FakeAutomator:
-            def __init__(self, feed):
+            def __init__(self, feed, report_text=None):
                 self.feed = feed
+                self.report_text = report_text
 
             def submit(self, row):
                 submitted.append(row["bvid"])
@@ -151,8 +174,9 @@ class MonitoringTests(unittest.TestCase):
             login_confirmed = True
 
         class FakeAutomator:
-            def __init__(self, feed):
+            def __init__(self, feed, report_text=None):
                 self.feed = feed
+                self.report_text = report_text
 
             def submit(self, row):
                 raise app.ReportNeedsDetails("已打开版权投诉页面；页面：https://www.bilibili.com/pc/community/copyright")
@@ -266,8 +290,9 @@ class MonitoringTests(unittest.TestCase):
             login_confirmed = True
 
         class FakeAutomator:
-            def __init__(self, feed):
+            def __init__(self, feed, report_text=None):
                 self.feed = feed
+                self.report_text = report_text
 
             def submit(self, row):
                 submitted.append(row["bvid"])
@@ -281,6 +306,186 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(result["submitted"], 1)
         self.assertEqual(submitted, ["BV0000000002"])
         self.assertEqual(self.store.list()["videos"][0]["report_status"], "submitted")
+
+    def test_coin_probe_records_caps_for_new_records_and_reports_failures(self):
+        self.baseline()
+        scan(Feed(payload([item(2, ts=130), item(3, ts=140), item(1)])), self.store)
+        # 基线记录不参与自动检测，只检测新投稿。
+        self.assertEqual([row["bvid"] for row in self.store.coin_pending()],
+                         ["BV0000000002", "BV0000000003"])
+        result = app.probe_coins(self.store, self.store.coin_pending(), pause=0,
+                                 opener=view_opener({"BV0000000002": 1, "BV0000000003": 2}))
+        self.assertEqual(result, {"checked": 2, "failed": 0})
+        rows = {row["bvid"]: row for row in self.store.list()["videos"]}
+        self.assertEqual((rows["BV0000000002"]["copyright"], rows["BV0000000002"]["coin_limit"]),
+                         (1, 2))
+        self.assertEqual((rows["BV0000000003"]["copyright"], rows["BV0000000003"]["coin_limit"]),
+                         (2, 1))
+        self.assertIn("可投 2 币", rows["BV0000000002"]["coin_note"])
+        self.assertTrue(rows["BV0000000002"]["coin_checked_at"])
+        self.assertEqual(self.store.list()["suspected_count"], 1)
+        self.assertEqual(self.store.list()["coin_counts"], {1: 1, 2: 1, 0: 1})
+        self.assertEqual(self.store.coin_pending(), [])
+
+        def failing(request, timeout=None):
+            raise urllib.error.URLError("network down")
+
+        failed = app.probe_coins(self.store, [{"bvid": "BV0000000002"}], pause=0, opener=failing)
+        self.assertEqual(failed, {"checked": 0, "failed": 1})
+        row = {r["bvid"]: r for r in self.store.list()["videos"]}["BV0000000002"]
+        self.assertIn("检测失败", row["coin_note"])
+        # 失败的记录不会被每轮自动重试，但可以手动重测。
+        self.assertEqual(self.store.coin_pending(), [])
+        self.assertEqual([r["bvid"] for r in self.store.coin_pending(bvid="BV0000000002")],
+                         ["BV0000000002"])
+
+    def test_monitor_loads_and_validates_saved_settings(self):
+        self.store.set("report_text", "保存的举报词 {title}")
+        monitor = app.Monitor(self.store, Path(self.temp.name))
+        self.assertEqual(monitor.report_text, "保存的举报词 {title}")
+        self.assertTrue(monitor.coin_watch)
+        self.store.set("report_text", 123)
+        self.assertEqual(app.Monitor(self.store, Path(self.temp.name)).report_text,
+                         app.REPORT_TEXT_DEFAULT)
+        self.store.set("coin_watch", False)
+        self.assertFalse(app.Monitor(self.store, Path(self.temp.name)).coin_watch)
+
+    def test_auto_report_uses_the_configured_report_text(self):
+        self.baseline()
+        scan(Feed(payload([item(2, ts=130), item(1)])), self.store)
+        monitor = app.Monitor(self.store, Path(self.temp.name))
+        monitor.mode = "auto"
+        monitor.report_text = "自定义举报词 {title} {coin}{source}"
+        seen = []
+
+        class LoggedInFeed:
+            login_confirmed = True
+
+        class FakeAutomator:
+            def __init__(self, feed, report_text=None):
+                seen.append(report_text)
+
+            def submit(self, row):
+                return None
+
+        original = app.ReportAutomator
+        app.ReportAutomator = FakeAutomator
+        try:
+            monitor.auto_report(LoggedInFeed())
+        finally:
+            app.ReportAutomator = original
+        self.assertEqual(seen, ["自定义举报词 {title} {coin}{source}"])
+
+    def test_probe_pass_drains_the_new_record_backlog_in_batches(self):
+        self.baseline()
+        scan(Feed(payload([item(n, ts=200 + n) for n in range(2, 57)] + [item(1)])),
+             self.store)
+        self.assertEqual(len(self.store.coin_pending()), 20)
+        monitor = app.Monitor(self.store, Path(self.temp.name))
+        batches = []
+
+        def fake_probe(store, rows, stop=None, pause=0.4, opener=None):
+            batches.append(len(rows))
+            for row in rows:
+                store.set_coin(row["bvid"], 2, "仅可投 1 币 · 稿件标注为转载")
+            return {"checked": len(rows), "failed": 0}
+
+        original = app.probe_coins
+        app.probe_coins = fake_probe
+        try:
+            result = monitor._probe_coins()
+        finally:
+            app.probe_coins = original
+        self.assertEqual(batches, [20, 20, 15])
+        self.assertEqual(result, {"checked": 55, "failed": 0})
+        self.assertEqual(self.store.coin_pending(), [])
+        self.assertEqual(self.store.list()["coin_counts"], {0: 1, 2: 55})
+
+    def test_coin_probe_skips_the_backlog_when_watching_is_off(self):
+        self.baseline()
+        scan(Feed(payload([item(2, ts=130), item(3, ts=140), item(1)])), self.store)
+        monitor = app.Monitor(self.store, Path(self.temp.name))
+        monitor.coin_watch = False
+        monitor.coin_probe_bvid = "BV0000000003"
+        batches = []
+
+        def fake_probe(store, rows, stop=None, pause=0.4, opener=None):
+            batches.append([row["bvid"] for row in rows])
+            return {"checked": len(rows), "failed": 0}
+
+        original = app.probe_coins
+        app.probe_coins = fake_probe
+        try:
+            monitor._probe_coins()
+        finally:
+            app.probe_coins = original
+        self.assertEqual(batches, [["BV0000000003"]])
+        self.assertEqual([row["bvid"] for row in self.store.coin_pending()],
+                         ["BV0000000002", "BV0000000003"])
+
+    def test_coin_pending_refresh_all_pages_with_offset(self):
+        self.baseline()
+        scan(Feed(payload([item(n, ts=200 + n) for n in range(2, 45)] + [item(1)])),
+             self.store)
+        first = self.store.coin_pending(refresh_all=True)
+        second = self.store.coin_pending(refresh_all=True, offset=20)
+        self.assertEqual((len(first), len(second)), (20, 20))
+        self.assertEqual({row["bvid"] for row in first} & {row["bvid"] for row in second},
+                         set())
+        self.assertEqual(len(self.store.coin_pending(refresh_all=True, offset=40)), 4)
+
+    def test_coin_marks_follow_the_monitored_account(self):
+        self.baseline()
+        scan(Feed(payload([item(2, ts=130), item(1)])), self.store)
+        app.probe_coins(self.store, self.store.coin_pending(), pause=0,
+                        opener=view_opener({"BV0000000002": 1}))
+        self.assertEqual(self.store.list()["suspected_count"], 1)
+        self.assertEqual(self.store.list()["coin_counts"], {0: 1, 1: 1})
+        # 换到自定义 UID 后，另一个账号的标注不计入本账号统计。
+        self.store.change_uid("778899")
+        self.assertEqual(self.store.list()["suspected_count"], 0)
+        self.assertEqual(self.store.list()["coin_counts"], {})
+        rows, _, _ = parse_feed(payload([item(5, ts=500, mid="778899")]), self.store.uid())
+        self.store.ingest(rows, baseline=True)
+        self.assertEqual([row["bvid"] for row in self.store.coin_pending(refresh_all=True)],
+                         ["BV0000000005"])
+        app.probe_coins(self.store, self.store.coin_pending(refresh_all=True), pause=0,
+                        opener=view_opener({"BV0000000005": 1}))
+        self.assertEqual(self.store.list()["coin_counts"], {1: 1})
+        self.assertEqual(self.store.list()["suspected_count"], 1)
+        self.store.change_uid(UID)
+        self.assertEqual(self.store.list()["coin_counts"], {0: 1, 1: 1})
+        self.assertEqual(self.store.list()["suspected_count"], 1)
+
+    def test_coin_probe_and_refresh_all_cover_baseline_records(self):
+        self.baseline()
+        rows = self.store.coin_pending(refresh_all=True)
+        self.assertEqual([row["bvid"] for row in rows], ["BV0000000001"])
+
+    def test_coin_columns_migrate_on_a_legacy_database(self):
+        path = Path(self.temp.name) / "legacy-coins.sqlite3"
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE videos (bvid TEXT PRIMARY KEY, title TEXT NOT NULL,
+                description TEXT NOT NULL, published_at TEXT NOT NULL,
+                published_ts INTEGER NOT NULL, url TEXT NOT NULL,
+                source_url TEXT NOT NULL, source_kind TEXT NOT NULL,
+                dynamic_id TEXT NOT NULL, first_seen TEXT NOT NULL,
+                baseline INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                evidence_url TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '');
+            CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL, count INTEGER NOT NULL, title TEXT NOT NULL);
+        """)
+        db.execute("INSERT INTO videos VALUES ('BV0000000009','旧记录','','2026-01-01',"
+                   "1,'https://example.test','','','d','2026-01-01',1,'pending','','')")
+        db.commit()
+        db.close()
+        legacy = Store(path)
+        legacy.set_coin("BV0000000009", 1, "可投 2 币 · 稿件标注为自制")
+        row = legacy.list()["videos"][0]
+        self.assertEqual((row["copyright"], row["coin_limit"]), (1, 2))
+        self.assertIn("可投 2 币", row["coin_note"])
 
 
 class ReportLocatorTests(unittest.TestCase):
@@ -451,12 +656,81 @@ class ReportLocatorTests(unittest.TestCase):
     def test_report_description_names_translation_and_reupload(self):
         row = {"bvid": "BV1234567890", "title": "测试视频",
                "source_url": "https://www.youtube.com/watch?v=abcdefghijk"}
-        text = app.ReportAutomator._copyright_description(row)
+        text = app.report_description(row)
         self.assertIn("翻译成中文", text)
         self.assertIn("搬运", text)
         self.assertIn("测试视频", text)
         self.assertIn(row["source_url"], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_report_description_fills_placeholders_from_a_custom_template(self):
+        row = {"bvid": "BV1234567890", "title": "测试视频",
+               "url": "https://www.bilibili.com/video/BV1234567890/",
+               "source_url": "https://www.youtube.com/watch?v=abcdefghijk", "copyright": 1}
+        text = app.report_description(row, "{title}|{bvid}|{url}|{source}|{coin}")
+        self.assertEqual(text, "测试视频|BV1234567890|https://www.bilibili.com/video/BV1234567890/|"
+                               "https://www.youtube.com/watch?v=abcdefghijk|"
+                               "该稿件标注为自制、可投 2 个币，请一并核查其原创声明；")
+        self.assertIn("可投 2 个币", app.report_description(row))
+        self.assertEqual(app.report_description({**row, "copyright": 2}).count("仅可投 1 个币"), 1)
+        # 未检测到投币上限时占位符留空，且超长文案仍受版权投诉页 400 字上限约束。
+        self.assertNotIn("币", app.report_description({**row, "copyright": 0}, "{coin}"))
+        long_text = app.report_description({**row, "title": "长" * 800})
+        self.assertEqual(len(long_text), 400)
+
+    def test_coin_verdict_maps_publish_mark_to_coin_cap(self):
+        repost = app.coin_verdict(2)
+        self.assertEqual((repost["mark"], repost["coin_limit"]), ("转载", 1))
+        self.assertIn("仅可投 1 币", repost["coin_note"])
+        self.assertEqual(repost["suspicion"], "已标注转载")
+        self_claim = app.coin_verdict(1)
+        self.assertEqual((self_claim["mark"], self_claim["coin_limit"]), ("自制", 2))
+        self.assertIn("可投 2 币", self_claim["coin_note"])
+        self.assertEqual(self_claim["suspicion"], "疑似转载投自制")
+        unknown = app.coin_verdict(0)
+        self.assertEqual((unknown["coin_limit"], unknown["coin_sentence"]), (0, ""))
+        self.assertEqual(app.coin_limit_for(None), 0)
+
+    def test_report_text_validation_keeps_templates_usable(self):
+        self.assertEqual(app.validate_report_text("  自定义文案  "), "自定义文案")
+        for value, message in (("", "不能为空"), ("{not_a_field}", "占位符无效"),
+                               ("字" * 1001, "过长")):
+            with self.assertRaisesRegex(ValueError, message):
+                app.validate_report_text(value)
+
+    def test_coin_probe_reads_bilibili_view_response(self):
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        seen = []
+
+        def opener(request, timeout=None):
+            seen.append(request.full_url)
+            return Response({"code": 0, "data": {"copyright": 2}})
+
+        verdict = app.probe_copyright("BV1234567890", opener=opener)
+        self.assertEqual((verdict["copyright"], verdict["coin_limit"]), (2, 1))
+        self.assertIn("bvid=BV1234567890", seen[0])
+        with self.assertRaisesRegex(ValueError, "BV 号无效"):
+            app.probe_copyright("not-a-bv", opener=opener)
+        with self.assertRaisesRegex(RuntimeError, "未返回"):
+            app.probe_copyright("BV1234567890",
+                                opener=lambda request, timeout=None: Response(
+                                    {"code": 0, "data": {}}))
+        with self.assertRaisesRegex(RuntimeError, "返回 -404"):
+            app.probe_copyright("BV1234567890",
+                                opener=lambda request, timeout=None: Response(
+                                    {"code": -404, "message": "啥都木有"}))
 
     def test_copyright_form_skips_role_step_after_same_page_navigation(self):
         class Candidate:
@@ -572,6 +846,15 @@ class LocalHTTPTests(unittest.TestCase):
         self.assertEqual(status["mode"], "auto")
         self.assertEqual(self.server.store.get("mode"), "auto")
 
+    def test_panel_reports_the_app_version(self):
+        with self.request("/api/status") as r:
+            self.assertEqual(json.load(r)["version"], app.APP_VERSION)
+        with self.request("/") as r:
+            html = r.read().decode("utf-8")
+        self.assertIn('id="app-version"', html)
+        self.assertIn(f"v{app.APP_VERSION}", html)
+        self.assertEqual(app.Handler.server_version, f"BiliWatch/{app.APP_VERSION}")
+
     def test_brand_assets_are_served_locally(self):
         with self.request("/logo.svg") as r:
             self.assertEqual(r.headers.get_content_type(), "image/svg+xml")
@@ -614,6 +897,52 @@ class LocalHTTPTests(unittest.TestCase):
             self.assertTrue(json.load(r)["ok"])
         row = {row["bvid"]: row for row in self.server.store.list()["videos"]}["BV0000000002"]
         self.assertEqual(row["report_status"], "queued")
+
+    def test_report_text_and_coin_controls_require_token_and_persist(self):
+        with self.request("/api/status") as r:
+            token = json.load(r)["token"]
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.request("/api/control", {"action": "report_text", "text": "偷改"})
+        self.assertEqual(exc.exception.code, 403)
+        with self.assertRaises(urllib.error.HTTPError) as bad:
+            self.request("/api/control", {"action": "report_text", "text": "{没有这占位符}"}, token)
+        self.assertEqual(bad.exception.code, 400)
+        custom = "举报《{title}》翻译搬运；{coin}{source}"
+        with self.request("/api/control", {"action": "report_text", "text": custom}, token) as r:
+            self.assertTrue(json.load(r)["ok"])
+        with self.request("/api/status") as r:
+            status = json.load(r)
+        self.assertEqual(status["report_text"], custom)
+        self.assertEqual(status["report_text_default"], app.REPORT_TEXT_DEFAULT)
+        self.assertIn("coin", status["report_placeholders"])
+        reopened = Store(Path(self.temp.name) / "records.sqlite3")
+        self.assertEqual(reopened.get("report_text"), custom)
+        with self.request("/api/control", {"action": "report_text_reset"}, token) as r:
+            self.assertTrue(json.load(r)["ok"])
+        self.assertEqual(self.server.monitor.report_text, app.REPORT_TEXT_DEFAULT)
+
+        with self.request("/api/control", {"action": "coin_watch", "enabled": False}, token) as r:
+            self.assertTrue(json.load(r)["ok"])
+        self.assertFalse(self.server.monitor.coin_watch)
+        self.assertFalse(reopened.get("coin_watch"))
+        with self.assertRaises(urllib.error.HTTPError) as bad_bv:
+            self.request("/api/control", {"action": "coin_probe", "bvid": "不是BV"}, token)
+        self.assertEqual(bad_bv.exception.code, 400)
+        with self.request("/api/control", {"action": "coin_probe", "bvid": "BV0000000001"}, token) as r:
+            self.assertTrue(json.load(r)["ok"])
+        self.assertEqual(self.server.monitor.coin_probe_bvid, "BV0000000001")
+        self.assertTrue(self.server.monitor.check_requested)
+
+    def test_videos_and_csv_expose_the_coin_columns(self):
+        self.server.store.set_coin("BV0000000001", 1, "可投 2 币 · 稿件标注为自制")
+        with self.request("/api/videos") as r:
+            row = json.load(r)["videos"][0]
+        self.assertEqual((row["copyright"], row["coin_limit"]), (1, 2))
+        self.assertIn("可投 2 币", row["coin_note"])
+        with self.request("/api/export") as r:
+            header = r.read().decode("utf-8-sig").splitlines()[0]
+        self.assertIn("coin_limit", header)
+        self.assertIn("coin_note", header)
 
 
 if __name__ == "__main__":

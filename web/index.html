@@ -5,7 +5,7 @@
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <link rel="alternate icon" type="image/x-icon" href="/favicon.ico"></head>
 <body>
-<header><div class="brand"><img src="/logo.svg" alt="" width="30" height="30">投稿观察 <span>BILI WATCH</span></div><nav>
+<header><div class="brand"><img src="/logo.svg" alt="" width="30" height="30">投稿观察 <span>BILI WATCH</span><span id="app-version" title="当前版本">v1.1.0</span></div><nav>
 <a id="space" href="https://space.bilibili.com/1263732318/dynamic" target="_blank" rel="noreferrer">查看 UP 空间 ↗</a>
 <button id="shutdown" class="quiet">关闭工具</button></nav></header>
 <main>
@@ -14,22 +14,24 @@
 <div class="connection"><span id="dot" class="dot"></span><strong id="phase">正在连接</strong><p id="message" role="status">正在读取本地工具状态…</p></div></section>
 <section class="toolbar" aria-label="监控设置">
 <div class="actions"><button id="check" class="primary">立即检查</button><button id="toggle">暂停监控</button>
-<button id="browser">打开独立登录窗口</button><button id="browser-ready" disabled>我已登录，开始举报</button><button id="notify">启用桌面提醒</button></div>
+<button id="browser">打开独立登录窗口</button><button id="browser-ready" disabled>我已登录，开始举报</button><button id="coin-scan">检测投币上限</button><button id="notify">启用桌面提醒</button></div>
 <div class="settings"><label>监控 UID <span class="uid-edit"><input id="uid" inputmode="numeric" autocomplete="off" maxlength="19" aria-label="要监控的 B 站 UID" title="B 站空间地址末尾的数字 ID"><button id="uid-save" type="button">更改</button></span></label>
 <label>处理模式 <select id="mode"><option value="manual">人工审核</option><option value="auto">机器自动举报</option></select></label>
-<label>检查间隔 <select id="interval"><option value="120">2 分钟</option><option value="300">5 分钟</option><option value="600" selected>10 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></label></div>
+<label>检查间隔 <select id="interval"><option value="120">2 分钟</option><option value="300">5 分钟</option><option value="600" selected>10 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></label>
+<label class="check"><input id="coin-watch" type="checkbox"> 自动检测投币上限</label>
+<button id="report-text-open" type="button">举报词设置</button></div>
 </section>
 <p id="mode-help" class="mode-help">人工审核：发现新投稿后打开记录，核实证据并在 B 站手动提交举报。自动模式需要先在独立登录窗口完成登录。</p>
 <div class="timing"><span>上次检查 <b id="last">—</b></span><span>下次检查 <b id="next">—</b></span><span id="storage"></span></div>
-<section class="stats" aria-label="存档统计"><div><span>已存档</span><strong id="count">0</strong></div><div><span>基线后新增</span><strong id="new-count">0</strong></div><div><span>待核实</span><strong id="pending-count">0</strong></div><div><span>待自动举报</span><strong id="report-queue-count">0</strong></div><div><span>已提交举报</span><strong id="report-submitted-count">0</strong></div><div><span>待补充材料</span><strong id="report-details-count">0</strong></div></section>
-<section class="records"><div class="section-head"><div><h2>投稿记录</h2><p>原片链接来自投稿简介或标题线索，授权情况需另行核实。</p></div><a class="button" href="/api/export">导出证据 CSV</a></div>
+<section class="stats" aria-label="存档统计"><div><span>已存档</span><strong id="count">0</strong></div><div><span>基线后新增</span><strong id="new-count">0</strong></div><div><span>待核实</span><strong id="pending-count">0</strong></div><div><span>待自动举报</span><strong id="report-queue-count">0</strong></div><div><span>已提交举报</span><strong id="report-submitted-count">0</strong></div><div><span>待补充材料</span><strong id="report-details-count">0</strong></div><div><span>疑似转载投自制</span><strong id="suspected-count">0</strong></div></section>
+<section class="records"><div class="section-head"><div><h2>投稿记录</h2><p>原片链接来自投稿简介或标题线索，授权情况需另行核实。版权标注取自 B 站视频详情的“自制 / 转载”标记：转载只能投 1 个币，自制可投 2 个币。</p></div><a class="button" href="/api/export">导出证据 CSV</a></div>
 <div class="filters"><label class="search-label"><span class="sr-only">搜索标题、BV 号、笔记</span><input id="search" type="search" placeholder="搜索标题、BV 号、核实笔记"></label>
 <label><span class="sr-only">核实状态</span><select id="filter"><option value="">全部状态</option><option value="pending">待核实</option><option value="reviewed">已核实</option><option value="dismissed">无需处理</option><option value="handled">已人工处理</option></select></label></div>
 <div id="empty" class="empty"><strong>等待首次读取投稿</strong><p>首次读取会建立基线，之后新增的视频才触发提醒。</p></div>
-<div class="table-wrap"><table id="table" hidden><thead><tr><th scope="col">视频与发布时间</th><th scope="col">原片线索</th><th scope="col">核实状态</th><th scope="col">举报状态</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="table-wrap"><table id="table" hidden><thead><tr><th scope="col">视频与发布时间</th><th scope="col">原片线索</th><th scope="col">版权标注 / 投币</th><th scope="col">核实状态</th><th scope="col">举报状态</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="pagination"><span id="page-info">第 1 页</span><div><button id="prev">上一页</button><button id="next-page">下一页</button></div></div>
 </section>
-<footer>独立登录窗口使用单独的 EdgeProfile，不读取日常浏览器账号。<span id="footer-mode">当前为人工审核，举报由你在 B 站手动提交。</span></footer>
+<footer>独立登录窗口使用单独的 EdgeProfile，不读取日常浏览器账号。投币上限按 B 站“自制 / 转载”标记推断，仅作搬运线索。<span id="footer-mode">当前为人工审核，举报由你在 B 站手动提交。</span></footer>
 </main>
 <dialog id="editor"><form id="evidence-form"><div class="dialog-head"><h2>核实记录</h2><button id="close-editor" type="button" class="quiet">关闭</button></div>
 <p id="editor-title" class="editor-title"></p><label>核实状态<select id="edit-status" aria-label="核实状态"><option value="pending">待核实</option><option value="reviewed">已核实</option><option value="dismissed">无需处理</option><option value="handled">已人工处理</option></select></label>
@@ -37,5 +39,10 @@
 <label>核实笔记<textarea id="edit-notes" aria-label="核实笔记" rows="6" maxlength="20000" placeholder="记录匹配片段、时间点、原作者声明或授权线索。"></textarea></label>
 <details><summary>查看采集时的投稿简介</summary><pre id="description"></pre></details>
 <div class="dialog-actions"><button id="copy" type="button">复制证据摘要</button><button class="primary" type="submit">保存记录</button></div></form></dialog>
+<dialog id="report-dialog"><form id="report-form"><div class="dialog-head"><h2>举报词设置</h2><button id="close-report" type="button" class="quiet">关闭</button></div>
+<p class="editor-title">这段文字会填进版权投诉页的“举报说明”，也用于社区举报的说明框。占位符：<span id="report-placeholders"></span></p>
+<label>举报词<textarea id="report-text-input" rows="8" maxlength="1000" aria-label="自定义举报词"></textarea></label>
+<p class="mode-help">提交时会用当前记录的内容替换占位符；超过 400 字会被版权投诉页上限截断。</p>
+<div class="dialog-actions"><button id="report-reset" type="button">恢复默认</button><button class="primary" type="submit">保存举报词</button></div></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div><script src="/main.js"></script>
 </body></html>

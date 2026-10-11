@@ -15,8 +15,12 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.error
 from urllib.parse import parse_qs, urlsplit
+import urllib.request
 import webbrowser
+
+APP_VERSION = "1.1.0"
 
 # Default monitored UID; the user can change it from the panel and it is persisted.
 UID = "1263732318"
@@ -28,6 +32,38 @@ MODES = {"manual", "auto"}
 REPORT_STATUSES = {"not_requested", "queued", "submitting", "submitted", "failed",
                    "needs_details"}
 REPORT_REASON = "侵权"
+
+# B 站用稿件的“自制 / 转载”标注限制投币数：转载只能投 1 个币，自制可以投 2 个。
+# The flag doubles as a repost tell: 2 coins means the uploader claimed 自制 for it.
+COPYRIGHT_SELF = 1
+COPYRIGHT_REPOST = 2
+COIN_LIMITS = {COPYRIGHT_SELF: 2, COPYRIGHT_REPOST: 1}
+VIEW_API = "https://api.bilibili.com/x/web-interface/view?bvid="
+# B 站的风控会以 -412 拒绝 Referer 为站点的请求；_probe_headers() 因此带上视频页地址。
+PROBE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Origin": "https://www.bilibili.com",
+}
+COIN_PROBE_BATCH = 20
+COIN_PROBE_PASSES = 4
+
+# Default complaint wording. The user can edit it from the panel; placeholders are
+# filled from the archived record before it is typed into B 站's report form.
+REPORT_TEXT_DEFAULT = (
+    "被举报稿件《{title}》疑似将原视频翻译成中文后未经授权搬运发布，"
+    "译文内容、配音或画面与原片存在对应关系，请平台核查处理。{coin}原片出处：{source}")
+REPORT_TEXT_LIMIT = 1000
+REPORT_FIELD_LIMIT = 400
+REPORT_PLACEHOLDERS = {
+    "title": "被举报稿件的标题",
+    "bvid": "BV 号",
+    "url": "被举报稿件的 B 站链接",
+    "source": "核实到的原片链接",
+    "coin": "投币上限结论（如“该稿件标注为自制、可投 2 个币；”，未知时为空）",
+}
 
 
 def space_url(uid):
@@ -63,6 +99,128 @@ def source_clue(title, description):
     if match:
         return "https://www.youtube.com/watch?v=" + match[1], "根据标题末尾 ID 推测，待核实"
     return "", "尚未找到来源线索"
+
+
+def coin_limit_for(copyright_value):
+    """Coins a viewer can give: 转载 caps at 1, 自制 allows 2."""
+    try:
+        return COIN_LIMITS.get(int(copyright_value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def coin_verdict(copyright_value):
+    """Describe one video's 自制/转载 mark and the coin cap it implies."""
+    try:
+        value = int(copyright_value)
+    except (TypeError, ValueError):
+        value = 0
+    limit = coin_limit_for(value)
+    if value == COPYRIGHT_SELF:
+        return {"copyright": value, "coin_limit": limit, "mark": "自制",
+                "coin_note": "可投 2 币 · 稿件标注为自制",
+                "suspicion": "疑似转载投自制",
+                "coin_sentence": "该稿件标注为自制、可投 2 个币，请一并核查其原创声明；"}
+    if value == COPYRIGHT_REPOST:
+        return {"copyright": value, "coin_limit": limit, "mark": "转载",
+                "coin_note": "仅可投 1 币 · 稿件标注为转载",
+                "suspicion": "已标注转载",
+                "coin_sentence": "该稿件标注为转载、仅可投 1 个币；"}
+    return {"copyright": 0, "coin_limit": 0, "mark": "未知",
+            "coin_note": "尚未检测投币上限", "suspicion": "", "coin_sentence": ""}
+
+
+def coin_sentence(row):
+    """Coin-based evidence sentence for the report text, empty when unknown."""
+    if not row or not row.get("copyright"):
+        return ""
+    return coin_verdict(row.get("copyright"))["coin_sentence"]
+
+
+def validate_report_text(value):
+    """Keep the editable complaint wording usable for B 站's report forms."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("举报词不能为空；可点“恢复默认”取回内置文案")
+    if len(text) > REPORT_TEXT_LIMIT:
+        raise ValueError(f"举报词过长，最多 {REPORT_TEXT_LIMIT} 字")
+    unknown = sorted(set(re.findall(r"\{([^{}]*)\}", text)) - set(REPORT_PLACEHOLDERS))
+    if unknown:
+        raise ValueError("举报词占位符无效：" + "、".join("{" + name + "}" for name in unknown)
+                         + "；可用占位符：" + "、".join("{" + name + "}"
+                                                       for name in REPORT_PLACEHOLDERS))
+    return text
+
+
+def report_description(row, template=REPORT_TEXT_DEFAULT):
+    """Render the (user editable) complaint statement for one archived record."""
+    row = row or {}
+    values = {
+        "title": str(row.get("title") or row.get("bvid") or "").strip(),
+        "bvid": str(row.get("bvid") or "").strip(),
+        "url": str(row.get("url") or "").strip(),
+        "source": str(row.get("source_url") or "").strip() or "未找到",
+        "coin": coin_sentence(row),
+    }
+    text = str(template or REPORT_TEXT_DEFAULT)
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", value)
+    # The copyright complaint form caps its description field.
+    return text.strip()[:REPORT_FIELD_LIMIT]
+
+
+def probe_copyright(bvid, opener=None, timeout=15):
+    """Read B 站's own 自制/转载 mark for one video and infer the coin cap.
+
+    This is the same public field the site uses to limit coins, so it needs no
+    account and no browser session. Failures are reported, never guessed.
+    """
+    bvid = str(bvid or "").strip()
+    if not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid):
+        raise ValueError("BV 号无效，无法检测投币上限")
+    headers = dict(PROBE_HEADERS, Referer=f"https://www.bilibili.com/video/{bvid}/")
+    request = urllib.request.Request(VIEW_API + bvid, headers=headers)
+    opener = opener or urllib.request.urlopen
+    try:
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"B 站接口返回 HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"无法连接 B 站接口：{exc.reason}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("B 站接口返回的内容无法解析") from exc
+    if payload.get("code") != 0:
+        raise RuntimeError(f"B 站接口返回 {payload.get('code')}：{payload.get('message', '')}"
+                           .strip())
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("B 站视频详情结构发生变化")
+    verdict = coin_verdict(data.get("copyright"))
+    if not verdict["copyright"]:
+        raise RuntimeError("B 站未返回该稿件的自制/转载标注")
+    return verdict
+
+
+def probe_coins(store, rows, stop=None, pause=0.4, opener=None):
+    """Record the coin verdict for archived videos; never abort the whole scan."""
+    done, failed = 0, 0
+    for index, row in enumerate(rows):
+        if stop and stop.is_set():
+            break
+        if index and pause:
+            time.sleep(pause)
+        try:
+            verdict = probe_copyright(row.get("bvid"), opener=opener)
+        except Exception as exc:
+            failed += 1
+            logging.info("coin probe failed for %s: %s", row.get("bvid"), exc)
+            note = f"检测失败：{exc}（可点“重新检测投币”）"
+            store.set_coin(row["bvid"], 0, note)
+            continue
+        done += 1
+        store.set_coin(row["bvid"], verdict["copyright"], verdict["coin_note"])
+    return {"checked": done, "failed": failed}
 
 
 def parse_feed(payload, uid=UID):
@@ -129,6 +287,10 @@ class Store:
                 "report_status": "TEXT NOT NULL DEFAULT 'not_requested'",
                 "report_message": "TEXT NOT NULL DEFAULT ''",
                 "reported_at": "TEXT NOT NULL DEFAULT ''",
+                "copyright": "INTEGER NOT NULL DEFAULT 0",
+                "coin_limit": "INTEGER NOT NULL DEFAULT 0",
+                "coin_note": "TEXT NOT NULL DEFAULT ''",
+                "coin_checked_at": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -232,11 +394,17 @@ class Store:
             report_counts = dict(db.execute(
                 "SELECT report_status,COUNT(*) FROM videos WHERE uid=? GROUP BY report_status",
                 (uid,)))
+            coin_counts = dict(db.execute(
+                "SELECT copyright,COUNT(*) FROM videos WHERE uid=? GROUP BY copyright", (uid,)))
+            suspected = db.execute(
+                "SELECT COUNT(*) FROM videos WHERE uid=? AND copyright=?",
+                (uid, COPYRIGHT_SELF)).fetchone()[0]
             event = db.execute(
                 "SELECT * FROM events WHERE uid=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
         return {"videos": [dict(r) for r in rows], "total": total,
                 "counts": counts, "new_count": new_count,
                 "report_counts": report_counts,
+                "coin_counts": coin_counts, "suspected_count": suspected,
                 "event": dict(event) if event else None, "page": page}
 
     def update(self, bvid, body):
@@ -288,6 +456,37 @@ class Store:
                                 (bvid,))
             if not cursor.rowcount:
                 raise ValueError("举报状态已变化，请刷新后重试")
+
+    def set_coin(self, bvid, copyright_value, note):
+        """Persist one video's 自制/转载 mark, its implied coin cap, and the verdict text.
+
+        A recorded failure also stamps `coin_checked_at` so a broken B 站 endpoint is
+        not hammered every cycle; the panel offers a manual re-check instead.
+        """
+        limit = coin_limit_for(copyright_value)
+        with self.connect() as db:
+            cursor = db.execute("""UPDATE videos SET copyright=?, coin_limit=?, coin_note=?,
+                coin_checked_at=? WHERE bvid=?""",
+                (int(copyright_value or 0), limit, str(note)[:500], stamp(), str(bvid)))
+            if not cursor.rowcount:
+                raise ValueError("视频记录不存在")
+
+    def coin_pending(self, refresh_all=False, bvid="", offset=0):
+        """Videos whose coin cap still needs reading, oldest first so backlog stays orderly."""
+        uid = self.uid()
+        with self.connect() as db:
+            if bvid:
+                rows = db.execute("SELECT * FROM videos WHERE bvid=? AND uid=?",
+                                  (str(bvid), uid)).fetchall()
+            elif refresh_all:
+                rows = db.execute("SELECT * FROM videos WHERE uid=?"
+                                  " ORDER BY published_ts ASC LIMIT ? OFFSET ?",
+                                  (uid, COIN_PROBE_BATCH, max(0, int(offset)))).fetchall()
+            else:
+                rows = db.execute("""SELECT * FROM videos WHERE uid=? AND baseline=0
+                    AND coin_checked_at='' ORDER BY published_ts ASC LIMIT ?""",
+                    (uid, COIN_PROBE_BATCH)).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_report(self, bvid, status, message=""):
         if status not in REPORT_STATUSES:
@@ -458,8 +657,9 @@ class ReportNeedsDetails(RuntimeError):
 class ReportAutomator:
     """Submit a report through the signed-in browser session, never by API."""
 
-    def __init__(self, feed):
+    def __init__(self, feed, report_text=None):
         self.feed = feed
+        self.report_text = report_text or REPORT_TEXT_DEFAULT
         self.last_failed_page = None
         self.debug_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "BiliWatch" / "report-debug"
 
@@ -577,19 +777,13 @@ class ReportAutomator:
         return ("填写我的信息" in normalized and "填写举证材料" in normalized) or (
             "账号实名认证" in normalized and "举证材料" in normalized)
 
-    @staticmethod
-    def _copyright_description(row):
-        """Build the short infringement statement accepted by the copyright form.
+    def _copyright_description(self, row):
+        """Render the (user editable) infringement statement for a record.
 
-        The monitored account translates the original video into Chinese and
-        re-uploads it, so the statement names that translate-and-reupload
-        pattern rather than a plain repost.
+        The built-in wording names the translate-and-reupload pattern used by the
+        monitored account and appends the coin-cap finding when it was detected.
         """
-        source = str(row.get("source_url") or "").strip()
-        title = str(row.get("title") or row.get("bvid") or "").strip()
-        return (f"被举报稿件《{title}》疑似将原视频翻译成中文后未经授权搬运发布，"
-                f"译文内容、配音或画面与原片存在对应关系，请平台核查处理。"
-                f"原片出处：{source}")[:400]
+        return report_description(row, self.report_text)
 
     def _click_copyright_submit(self, page):
         """Click the submit control on Bilibili's full-page copyright form."""
@@ -913,7 +1107,7 @@ class ReportAutomator:
                 'textarea, input[placeholder*="描述"], textarea[placeholder*="说明"]')
             field = description
             if field:
-                field.fill(f"疑似将原片翻译成中文后未经授权搬运；原片线索：{row['source_url']}")
+                field.fill(self._copyright_description(row))
             self._click_text(active_page, ("提交举报", "提交", "确认举报", "确定"))
             try:
                 active_page.get_by_text("举报成功", exact=False).wait_for(
@@ -1010,6 +1204,12 @@ class Monitor:
         self.mode = store.get("mode", "manual")
         if self.mode not in MODES:
             self.mode = "manual"
+        self.report_text = store.get("report_text", REPORT_TEXT_DEFAULT)
+        if not isinstance(self.report_text, str) or not self.report_text.strip():
+            self.report_text = REPORT_TEXT_DEFAULT
+        self.coin_watch = bool(store.get("coin_watch", True))
+        self.coin_probe_bvid = ""
+        self.coin_probe_all = False
         self.state = {"phase": "starting", "message": "正在启动监控", "last_check": "",
                       "next_check": "", "last_result": None}
         self.browser_open = False
@@ -1018,8 +1218,13 @@ class Monitor:
 
     def status(self):
         with self.lock:
-            return {**self.state, "enabled": self.enabled, "interval": self.interval,
+            return {**self.state, "version": APP_VERSION,
+                    "enabled": self.enabled, "interval": self.interval,
                     "mode": self.mode,
+                    "report_text": self.report_text,
+                    "report_text_default": REPORT_TEXT_DEFAULT,
+                    "report_placeholders": REPORT_PLACEHOLDERS,
+                    "coin_watch": self.coin_watch,
                     "browser_open": self.browser_open,
                     "browser_login_ready": self.browser_login_ready,
                     "uid": self.uid, "space_url": space_url(self.uid),
@@ -1067,6 +1272,34 @@ class Monitor:
                 self.store.retry_report(bvid)
                 self.check_requested = True
                 self.state.update(message=f"{bvid} 已重新加入举报队列")
+            elif action == "report_text":
+                value = validate_report_text(body.get("text"))
+                self.report_text = value
+                self.store.set("report_text", value)
+                self.state.update(message=("举报词已保存（内置文案）" if value == REPORT_TEXT_DEFAULT
+                                           else "举报词已保存"))
+            elif action == "report_text_reset":
+                self.report_text = REPORT_TEXT_DEFAULT
+                self.store.set("report_text", REPORT_TEXT_DEFAULT)
+                self.state.update(message="举报词已恢复为内置文案")
+            elif action == "coin_watch":
+                self.coin_watch = bool(body.get("enabled", True))
+                self.store.set("coin_watch", self.coin_watch)
+                self.state.update(message=("已开启新投稿的投币上限自动检测" if self.coin_watch
+                                           else "已关闭投币上限自动检测"))
+                if self.coin_watch:
+                    self.check_requested = True
+            elif action == "coin_probe":
+                bvid = str(body.get("bvid") or "").strip()
+                if not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid):
+                    raise ValueError("BV 号无效，无法检测投币上限")
+                self.coin_probe_bvid = bvid
+                self.check_requested = True
+                self.state.update(phase="checking", message=f"正在检测 {bvid} 的投币上限")
+            elif action == "coin_all":
+                self.coin_probe_all = True
+                self.check_requested = True
+                self.state.update(phase="checking", message="正在重新检测已存档投稿的投币上限")
             elif action == "interval":
                 interval = int(body.get("seconds", 600))
                 if not 120 <= interval <= 86400:
@@ -1078,6 +1311,53 @@ class Monitor:
                 raise ValueError("操作无效")
         self.wake.set()
 
+    def _probe_coins(self):
+        """Read B 站's 自制/转载 mark for pending or requested videos.
+
+        The video detail endpoint is public, so this needs no browser session and
+        still works while automatic reporting waits for a login. A backlog found by
+        one scan is drained in batches of COIN_PROBE_BATCH instead of waiting for the
+        next scheduled check.
+        """
+        with self.lock:
+            one = self.coin_probe_bvid
+            all_records = self.coin_probe_all
+            self.coin_probe_bvid = ""
+            self.coin_probe_all = False
+            watch = self.coin_watch
+        if not (watch or one or all_records):
+            return None
+        totals = {"checked": 0, "failed": 0}
+
+        def drain(rows):
+            result = probe_coins(self.store, rows, self.stop)
+            totals["checked"] += result["checked"]
+            totals["failed"] += result["failed"]
+
+        if one:
+            rows = self.store.coin_pending(bvid=one)
+            if rows:
+                drain(rows)
+            if not watch and not all_records:
+                return totals
+        if all_records:
+            for index in range(COIN_PROBE_PASSES):
+                rows = self.store.coin_pending(refresh_all=True, offset=index * COIN_PROBE_BATCH)
+                if not rows:
+                    break
+                drain(rows)
+                if self.stop.is_set():
+                    break
+            return totals
+        for _ in range(COIN_PROBE_PASSES):
+            rows = self.store.coin_pending()
+            if not rows:
+                break
+            drain(rows)
+            if self.stop.is_set():
+                break
+        return totals
+
     def auto_report(self, feed):
         if self.mode != "auto":
             return {"queued": 0, "submitted": 0, "failed": 0, "needs_details": 0}
@@ -1087,7 +1367,7 @@ class Monitor:
         candidates = self.store.queue_auto_reports()
         summary = {"queued": len(candidates), "submitted": 0, "failed": 0,
                    "needs_details": 0, "waiting_login": False}
-        automator = ReportAutomator(feed)
+        automator = ReportAutomator(feed, self.report_text)
         for row in candidates:
             if self.stop.is_set():
                 break
@@ -1152,6 +1432,7 @@ class Monitor:
                         with self.lock:
                             self.state.update(phase="waiting_login", message=str(exc))
                 if run:
+                    coins = self._probe_coins()
                     if self.mode == "auto" and (not feed.browser_open() or
                                                   not feed.login_confirmed):
                         self._publish_browser_state(feed)
@@ -1169,6 +1450,11 @@ class Monitor:
                     try:
                         result = scan(feed, self.store, self.stop, uid=self.uid)
                         failures = 0
+                        # 本次新抓到的投稿也要立刻看投币上限，不等下一个检查周期。
+                        fresh = self._probe_coins()
+                        if fresh:
+                            coins = {key: (coins or {}).get(key, 0) + fresh[key]
+                                     for key in ("checked", "failed")}
                         msg = (f"已建立基线：{result['seen']} 条现有投稿" if result["baseline"]
                                else f"本次发现 {result['added']} 条新增投稿")
                         reports = self.auto_report(feed)
@@ -1178,6 +1464,10 @@ class Monitor:
                                     f"，失败 {reports['failed']} 条")
                         elif self.mode == "auto" and reports.get("waiting_login"):
                             msg = "已读取投稿；自动举报等待独立浏览器登录确认"
+                        if coins and coins["checked"]:
+                            msg += f"；已检测 {coins['checked']} 条投稿的投币上限"
+                        if coins and coins["failed"]:
+                            msg += f"；{coins['failed']} 条投币检测失败，可在记录中重新检测"
                         self._publish_browser_state(feed)
                         if result["backlog"]:
                             msg += "；还有历史分页，下一次继续补查"
@@ -1187,8 +1477,12 @@ class Monitor:
                     except Exception as exc:
                         failures += 1
                         logging.exception("scan failed")
+                        message = str(exc)
+                        if coins and coins["checked"]:
+                            message += f"；已检测 {coins['checked']} 条投稿的投币上限"
                         with self.lock:
-                            self.state.update(phase="error", message=str(exc), last_check=stamp())
+                            self.state.update(phase="error", message=message,
+                                              last_check=stamp())
                     due = time.time() + min(21600, self.interval * (2 ** min(failures, 5)))
                     with self.lock:
                         self.state["next_check"] = stamp(due) if self.enabled else ""
@@ -1199,7 +1493,7 @@ class Monitor:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BiliWatch/1.0"
+    server_version = f"BiliWatch/{APP_VERSION}"
 
     def log_message(self, fmt, *args):
         logging.info(fmt, *args)
@@ -1241,7 +1535,8 @@ class Handler(BaseHTTPRequestHandler):
                 rows = self.server.store.export()
                 output = io.StringIO()
                 columns = ["bvid", "uid", "title", "url", "published_at", "first_seen",
-                           "baseline", "source_url", "source_kind", "status", "evidence_url",
+                           "baseline", "copyright", "coin_limit", "coin_note", "coin_checked_at",
+                           "source_url", "source_kind", "status", "evidence_url",
                            "notes", "description", "report_status", "report_message",
                            "reported_at"]
                 writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
