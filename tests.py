@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -817,7 +819,7 @@ class LocalHTTPTests(unittest.TestCase):
             req.add_header("X-Local-Token", token)
         return urllib.request.urlopen(req, timeout=5)
 
-    def test_real_http_notes_persist_and_csv_has_utf8_bom(self):
+    def test_real_http_notes_persist_and_csv_defaults_to_utf8_without_bom(self):
         with self.request("/api/status") as r:
             token = json.load(r)["token"]
         with self.request("/api/video/BV0000000001", {"status": "reviewed", "notes": "证据"}, token) as r:
@@ -826,8 +828,31 @@ class LocalHTTPTests(unittest.TestCase):
             self.assertEqual(json.load(r)["videos"][0]["notes"], "证据")
         with self.request("/api/export") as r:
             data = r.read()
-            self.assertTrue(data.startswith(b"\xef\xbb\xbf"))
-            self.assertIn("证据", data.decode("utf-8-sig"))
+            self.assertFalse(data.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(r.headers["Content-Type"], "text/csv; charset=utf-8")
+            self.assertIn('filename="bili-evidence.csv"', r.headers["Content-Disposition"])
+            rows = list(csv.DictReader(io.StringIO(data.decode("utf-8"))))
+            self.assertEqual(rows[0]["bvid"], "BV0000000001")
+            self.assertEqual(rows[0]["notes"], "证据")
+
+    def test_excel_csv_opt_in_only_adds_bom_and_changes_filename(self):
+        notes = '中文, "引号"\n换行'
+        self.server.store.update("BV0000000001", {"notes": notes})
+        with self.request("/api/export") as r:
+            standard = r.read()
+        with self.request("/api/export?excel=1") as r:
+            excel = r.read()
+            self.assertEqual(r.headers["Content-Type"], "text/csv; charset=utf-8")
+            self.assertIn('filename="bili-evidence-excel.csv"', r.headers["Content-Disposition"])
+        self.assertEqual(excel, b"\xef\xbb\xbf" + standard)
+        rows = list(csv.DictReader(io.StringIO(excel.decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["bvid"], "BV0000000001")
+        self.assertEqual(rows[0]["notes"], notes)
+
+    def test_csv_bom_requires_explicit_excel_opt_in(self):
+        for query in ("excel=0", "excel=", "excel=false", "excel=true"):
+            with self.subTest(query=query), self.request("/api/export?" + query) as r:
+                self.assertTrue(r.read().startswith(b"bvid,"))
 
     def test_external_origin_and_missing_token_cannot_mutate(self):
         for token, headers in [(None, {}), (self.server.token, {"Origin": "https://example.com"})]:
@@ -940,7 +965,7 @@ class LocalHTTPTests(unittest.TestCase):
         self.assertEqual((row["copyright"], row["coin_limit"]), (1, 2))
         self.assertIn("可投 2 币", row["coin_note"])
         with self.request("/api/export") as r:
-            header = r.read().decode("utf-8-sig").splitlines()[0]
+            header = r.read().decode("utf-8").splitlines()[0]
         self.assertIn("coin_limit", header)
         self.assertIn("coin_note", header)
 

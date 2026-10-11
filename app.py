@@ -1546,8 +1546,11 @@ class Handler(BaseHTTPRequestHandler):
                     writer.writerow({k: "'" + v if isinstance(v, str) and v[:1] in
                                      {"=", "+", "-", "@", "\t", "\r"} else v
                                      for k, v in row.items()})
-                self.send(output.getvalue().encode("utf-8-sig"),
-                          content_type="text/csv; charset=utf-8", filename="bili-evidence.csv")
+                excel = query.get("excel", [""])[0] == "1"
+                encoding = "utf-8-sig" if excel else "utf-8"
+                filename = "bili-evidence-excel.csv" if excel else "bili-evidence.csv"
+                self.send(output.getvalue().encode(encoding),
+                          content_type="text/csv; charset=utf-8", filename=filename)
             elif parts.path in {"/", "/index.html", "/style.css", "/main.js",
                                 "/logo.svg", "/logo-512.png", "/logo-128.png",
                                 "/icon.ico", "/favicon.ico"}:

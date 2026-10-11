@@ -11,3 +11,5 @@
 .coin-verdict{margin-top:6px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}.coin-verdict.warn{color:var(--accent);font-weight:600}
 .chip{font-size:11px;padding:1px 5px;border:1px dashed #c9ccd4;border-radius:4px;color:var(--muted);background:var(--surface);cursor:pointer}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
+.export-actions{display:flex;flex-direction:column;gap:8px;flex-shrink:0}
+@media(max-width:520px){.section-head{flex-wrap:wrap}.export-actions{flex-direction:row;flex-wrap:wrap}}
